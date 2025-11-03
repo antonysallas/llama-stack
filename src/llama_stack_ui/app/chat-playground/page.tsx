@@ -1137,7 +1137,14 @@ export default function ChatPlaygroundPage() {
 
           // Update full content with text that doesn't include thinking tags
           fullContent += deltaText;
-          const cleanedFullContent = extractThinkTags(fullContent).cleanText;
+          const extracted = extractThinkTags(fullContent);
+          let cleanedFullContent = extracted.cleanText;
+
+          // Remove any incomplete thinking tags from the display text during streaming
+          if (extracted.hasIncompleteTag) {
+            // Strip incomplete thinking block from the end
+            cleanedFullContent = cleanedFullContent.replace(/<think>[\s\S]*$/, '').trim();
+          }
 
           flushSync(() => {
             setCurrentSession(prev => {
@@ -1149,11 +1156,15 @@ export default function ChatPlaygroundPage() {
                 last.content = cleanedFullContent;
 
                 // Add thinking parts to the message
+                // Always set parts when we have thinking content to ensure proper rendering
                 if (thinkingParts.length > 0) {
                   last.parts = [
                     ...thinkingParts,
                     { type: "text", text: cleanedFullContent },
                   ];
+                } else {
+                  // Clear parts if no thinking blocks yet
+                  last.parts = undefined;
                 }
               }
               const updatedSession = {

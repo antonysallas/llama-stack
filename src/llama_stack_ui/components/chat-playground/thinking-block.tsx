@@ -15,6 +15,7 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
+import { CopyButton } from "@/components/ui/copy-button";
 
 export interface ThinkingPart {
   type: "thinking";
@@ -65,9 +66,9 @@ export function ThinkingBlock({
     <Collapsible
       open={isOpen}
       onOpenChange={setIsOpen}
-      className="my-2 rounded-lg border border-purple-200 bg-purple-50 dark:border-purple-800 dark:bg-purple-950/30"
+      className="group my-2 rounded-lg border border-purple-200 bg-purple-50 dark:border-purple-800 dark:bg-purple-950/30"
     >
-      <CollapsibleTrigger className="flex w-full items-center justify-between px-4 py-2.5 hover:bg-purple-100 dark:hover:bg-purple-900/30 transition-colors rounded-lg">
+      <CollapsibleTrigger className="flex w-full items-center justify-between gap-2 px-4 py-2.5 hover:bg-purple-100 dark:hover:bg-purple-900/30 transition-colors rounded-lg">
         <div className="flex items-center gap-2">
           {/* Pulsing Brain Icon */}
           <motion.div
@@ -132,6 +133,20 @@ export function ThinkingBlock({
               ))}
             </motion.div>
           )}
+        </div>
+
+        {/* Copy Button (shown on hover) */}
+        <div
+          className="opacity-0 group-hover:opacity-100 transition-opacity"
+          onClick={(e) => {
+            // Prevent the collapsible from toggling when clicking the copy button
+            e.stopPropagation();
+          }}
+        >
+          <CopyButton
+            content={part.content}
+            copyMessage="Thinking content copied to clipboard"
+          />
         </div>
 
         {/* Chevron Toggle Icon */}
