@@ -9,18 +9,26 @@ export const containsToolCall = (content: string): boolean => {
 };
 
 export const extractCleanText = (content: string): string | null => {
-  if (containsToolCall(content)) {
+  // Strip MCP tool metadata like {"question": "..."} from the start of responses
+  // This is commonly returned by GraphRAG and other MCP tools
+  let cleanedContent = content;
+  const questionJsonMatch = cleanedContent.match(/^\s*\{"question":\s*"[^"]*"\}\s*/);
+  if (questionJsonMatch) {
+    cleanedContent = cleanedContent.substring(questionJsonMatch[0].length);
+  }
+
+  if (containsToolCall(cleanedContent)) {
     try {
       // parse and extract non-function call parts
-      const jsonMatch = content.match(/\{"type":\s*"function"[^}]*\}[^}]*\}/);
+      const jsonMatch = cleanedContent.match(/\{"type":\s*"function"[^}]*\}[^}]*\}/);
       if (jsonMatch) {
         const jsonPart = jsonMatch[0];
         const parsedJson = JSON.parse(jsonPart);
 
         // if function call, extract text after JSON
         if (parsedJson.type === "function") {
-          const textAfterJson = content
-            .substring(content.indexOf(jsonPart) + jsonPart.length)
+          const textAfterJson = cleanedContent
+            .substring(cleanedContent.indexOf(jsonPart) + jsonPart.length)
             .trim();
           return textAfterJson || null;
         }
@@ -30,7 +38,7 @@ export const extractCleanText = (content: string): string | null => {
       return null;
     }
   }
-  return content;
+  return cleanedContent || null;
 };
 
 // removes function call JSON handling different content types

@@ -108,16 +108,21 @@ export function VectorDBCreator({
         throw new Error("Embedding dimension not available for selected model");
       }
 
-      const vectorDbId = vectorDbName.trim() || `vector_db_${Date.now()}`;
+      const vectorStoreName = vectorDbName.trim() || `vector_store_${Date.now()}`;
 
-      const response = await client.vectorDBs.register({
-        vector_db_id: vectorDbId,
+      // Use the new VectorStores API
+      const response = await client.vectorStores.create({
+        name: vectorStoreName,
         embedding_model: selectedEmbeddingModel,
         embedding_dimension: embeddingDimension,
         provider_id: selectedProvider,
       });
 
-      onVectorDBCreated?.(response.identifier || vectorDbId);
+      // Get the ID from the response (new format uses 'id' instead of 'identifier')
+      const storeId = (response as { id?: string; identifier?: string }).id ||
+        (response as { identifier?: string }).identifier ||
+        vectorStoreName;
+      onVectorDBCreated?.(storeId);
     } catch (err) {
       console.error("Error creating vector DB:", err);
       setError(

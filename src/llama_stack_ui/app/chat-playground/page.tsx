@@ -18,7 +18,17 @@ import { type Message } from "@/components/chat-playground/chat-message";
 import { VectorDBCreator } from "@/components/chat-playground/vector-db-creator";
 import { useAuthClient } from "@/hooks/use-auth-client";
 import type { Model } from "llama-stack-client/resources/models";
-import type { TurnCreateParams } from "llama-stack-client/resources/agents/turn";
+import type { ResponseCreateParams } from "llama-stack-client/resources/responses";
+import {
+  PromptTemplateStore,
+  type PromptTemplate,
+} from "@/lib/prompt-template-store";
+import {
+  isTextDeltaEvent,
+  isCompletedEvent,
+  isMCPCallInProgressEvent,
+  isMCPCallCompletedEvent,
+} from "@/types/responses";
 
 // Extended Model type to include properties from API response
 type ModelWithMetadata = Model & {
@@ -53,29 +63,37 @@ export default function ChatPlaygroundPage() {
   const [selectedModel, setSelectedModel] = useState<string>("");
   const [modelsLoading, setModelsLoading] = useState(true);
   const [modelsError, setModelsError] = useState<string | null>(null);
-  const [agents, setAgents] = useState<
-    Array<{
-      agent_id: string;
-      agent_config?: {
-        agent_name?: string;
-        name?: string;
-        instructions?: string;
-      };
-      [key: string]: unknown;
-    }>
-  >([]);
-  const [selectedAgentConfig, setSelectedAgentConfig] = useState<{
-    toolgroups?: Array<
-      string | { name: string; args: Record<string, unknown> }
-    >;
-  } | null>(null);
-  const [selectedAgentId, setSelectedAgentId] = useState<string>("");
-  const [agentsLoading, setAgentsLoading] = useState(true);
-  const [showCreateAgent, setShowCreateAgent] = useState(false);
-  const [newAgentName, setNewAgentName] = useState("");
-  const [newAgentInstructions, setNewAgentInstructions] = useState(
+  // Prompt Templates (formerly Agents) - stored in localStorage
+  const [templates, setTemplates] = useState<PromptTemplate[]>([]);
+  const [selectedTemplate, setSelectedTemplate] = useState<PromptTemplate | null>(null);
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string>("");
+  const [templatesLoading, setTemplatesLoading] = useState(true);
+  const [showCreateTemplate, setShowCreateTemplate] = useState(false);
+  const [newTemplateName, setNewTemplateName] = useState("");
+  const [newTemplateInstructions, setNewTemplateInstructions] = useState(
     "You are a helpful assistant."
   );
+
+  // Backward compatibility aliases for code that still uses agent terminology
+  const agents = templates.map(t => ({
+    agent_id: t.id,
+    agent_config: { agent_name: t.name, name: t.name, instructions: t.instructions },
+  }));
+  const selectedAgentId = selectedTemplateId;
+  const setSelectedAgentId = setSelectedTemplateId;
+  const selectedAgentConfig = selectedTemplate ? { toolgroups: selectedTemplate.tools } : null;
+  const setSelectedAgentConfig = (config: typeof selectedAgentConfig) => {
+    // No-op: config is derived from selectedTemplate
+    void config;
+  };
+  const agentsLoading = templatesLoading;
+  const setAgentsLoading = setTemplatesLoading;
+  const showCreateAgent = showCreateTemplate;
+  const setShowCreateAgent = setShowCreateTemplate;
+  const newAgentName = newTemplateName;
+  const setNewAgentName = setNewTemplateName;
+  const newAgentInstructions = newTemplateInstructions;
+  const setNewAgentInstructions = setNewTemplateInstructions;
   const [selectedToolgroups, setSelectedToolgroups] = useState<string[]>([]);
   const [availableToolgroups, setAvailableToolgroups] = useState<
     Array<{
@@ -83,6 +101,7 @@ export default function ChatPlaygroundPage() {
       provider_id: string;
       type: string;
       provider_resource_id?: string;
+      mcp_endpoint?: { uri: string };
     }>
   >([]);
   const [showCreateVectorDB, setShowCreateVectorDB] = useState(false);
@@ -104,279 +123,193 @@ export default function ChatPlaygroundPage() {
 
   const isModelsLoading = modelsLoading ?? true;
 
-  const loadAgentConfig = useCallback(
-    async (agentId: string) => {
+  // Load template config from localStorage (no longer from backend)
+  const loadTemplateConfig = useCallback(
+    (templateId: string) => {
       try {
-        // try to load from cache first
-        const cachedConfig = SessionUtils.loadAgentConfig(agentId);
-        if (cachedConfig) {
-          setSelectedAgentConfig({
-            toolgroups: cachedConfig.toolgroups,
-          });
-          return;
+        const template = PromptTemplateStore.get(templateId);
+        if (template) {
+          setSelectedTemplate(template);
+        } else {
+          setSelectedTemplate(null);
         }
-
-        const agentDetails = await client.agents.retrieve(agentId);
-
-        // cache config
-        SessionUtils.saveAgentConfig(agentId, {
-          ...agentDetails.agent_config,
-          toolgroups: agentDetails.agent_config?.toolgroups,
-        });
-
-        setSelectedAgentConfig({
-          toolgroups: agentDetails.agent_config?.toolgroups,
-        });
       } catch (error) {
-        console.error("Error loading agent config:", error);
-        setSelectedAgentConfig(null);
+        console.error("Error loading template config:", error);
+        setSelectedTemplate(null);
       }
     },
-    [client]
+    []
   );
 
+  // Backward compatibility alias
+  const loadAgentConfig = loadTemplateConfig;
+
   const createDefaultSession = useCallback(
-    async (agentId: string) => {
+    async (templateId: string) => {
       try {
-        const response = await client.agents.session.create(agentId, {
-          session_name: "Default Session",
-        });
+        let conversationId: string;
+
+        // Try to create a conversation via the API if available
+        try {
+          const response = await client.conversations.create({
+            metadata: {
+              template_id: templateId,
+              name: "Default Conversation",
+            },
+          });
+          conversationId = (response as { conversation_id?: string; id?: string }).conversation_id ||
+            (response as { id?: string }).id ||
+            crypto.randomUUID();
+        } catch {
+          // API might not be available, generate a local ID
+          conversationId = `conv_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        }
 
         const defaultSession: ChatSession = {
-          id: response.session_id,
-          name: "Default Session",
+          id: conversationId,
+          name: "Default Conversation",
           messages: [],
-          selectedModel: selectedModel, // use current selected model
+          selectedModel: selectedModel,
           systemMessage: "You are a helpful assistant.",
-          agentId,
+          templateId,
           createdAt: Date.now(),
           updatedAt: Date.now(),
         };
 
         setCurrentSession(defaultSession);
-        SessionUtils.saveCurrentSessionId(defaultSession.id, agentId);
-        // cache entire session data
-        SessionUtils.saveSessionData(agentId, defaultSession);
+        SessionUtils.saveCurrentSessionId(defaultSession.id, templateId);
+        SessionUtils.saveSessionData(templateId, defaultSession);
       } catch (error) {
-        console.error("Error creating default session:", error);
+        console.error("Error creating default conversation:", error);
       }
     },
     [client, selectedModel]
   );
 
-  const loadSessionMessages = useCallback(
-    async (agentId: string, sessionId: string): Promise<Message[]> => {
+  // Load messages from a conversation
+  // Since we cache sessions locally, this primarily serves as a fallback
+  const loadConversationMessages = useCallback(
+    async (conversationId: string): Promise<Message[]> => {
       try {
-        const session = await client.agents.session.retrieve(
-          agentId,
-          sessionId
-        );
+        // Try to retrieve from API if available
+        const conversation = await client.conversations.retrieve(conversationId);
 
-        if (!session || !session.turns || !Array.isArray(session.turns)) {
+        if (!conversation) {
+          return [];
+        }
+
+        // Handle different response formats
+        const messagesArray = (conversation as { messages?: unknown[] }).messages;
+        if (!messagesArray || !Array.isArray(messagesArray)) {
           return [];
         }
 
         const messages: Message[] = [];
-        for (const turn of session.turns) {
-          if (turn.input_messages && Array.isArray(turn.input_messages)) {
-            for (const input of turn.input_messages) {
-              if (input.role === "user" && input.content) {
-                messages.push({
-                  id: `${turn.turn_id}-user-${messages.length}`,
-                  role: "user",
-                  content:
-                    typeof input.content === "string"
-                      ? input.content
-                      : JSON.stringify(input.content),
-                  createdAt: new Date(turn.started_at || Date.now()),
-                });
-              }
-            }
-          }
-
-          if (turn.output_message && turn.output_message.content) {
-            console.log("Raw message content:", turn.output_message.content);
-            console.log("Content type:", typeof turn.output_message.content);
-
-            const cleanContent = cleanMessageContent(
-              turn.output_message.content
-            );
-
+        for (const msg of messagesArray) {
+          const msgObj = msg as { role?: string; content?: unknown; created_at?: string };
+          if (msgObj.role === "user" && msgObj.content) {
             messages.push({
-              id: `${turn.turn_id}-assistant-${messages.length}`,
+              id: `${conversationId}-user-${messages.length}`,
+              role: "user",
+              content:
+                typeof msgObj.content === "string"
+                  ? msgObj.content
+                  : JSON.stringify(msgObj.content),
+              createdAt: new Date(msgObj.created_at || Date.now()),
+            });
+          } else if (msgObj.role === "assistant" && msgObj.content) {
+            const cleanContent = cleanMessageContent(msgObj.content);
+            messages.push({
+              id: `${conversationId}-assistant-${messages.length}`,
               role: "assistant",
               content: cleanContent,
-              createdAt: new Date(
-                turn.completed_at || turn.started_at || Date.now()
-              ),
+              createdAt: new Date(msgObj.created_at || Date.now()),
             });
           }
         }
 
         return messages;
       } catch (error) {
-        console.error("Error loading session messages:", error);
+        console.error("Error loading conversation messages:", error);
         return [];
       }
     },
     [client]
   );
 
-  const loadAgentSessions = useCallback(
-    async (agentId: string) => {
+  // Backward compatibility alias
+  const loadSessionMessages = loadConversationMessages;
+
+  // Load conversations for a template
+  // Templates are stored locally, so we primarily use cached sessions
+  const loadTemplateConversations = useCallback(
+    async (templateId: string) => {
       try {
-        const response = await client.agents.session.list(agentId);
-
-        if (
-          response.data &&
-          Array.isArray(response.data) &&
-          response.data.length > 0
-        ) {
-          // check for saved session ID for this agent
-          const savedSessionId = SessionUtils.loadCurrentSessionId(agentId);
-          // try to load cached agent session data first
-          if (savedSessionId) {
-            const cachedSession = SessionUtils.loadSessionData(
-              agentId,
-              savedSessionId
-            );
-            if (cachedSession) {
-              setCurrentSession(cachedSession);
-              SessionUtils.saveCurrentSessionId(cachedSession.id, agentId);
-              return;
-            }
-            console.log("📡 Cache miss, fetching session from API...");
+        // First, try to load from local cache (primary source)
+        const savedConversationId = SessionUtils.loadCurrentSessionId(templateId);
+        if (savedConversationId) {
+          const cachedSession = SessionUtils.loadSessionData(templateId, savedConversationId);
+          if (cachedSession) {
+            setCurrentSession(cachedSession);
+            SessionUtils.saveCurrentSessionId(cachedSession.id, templateId);
+            return;
           }
-
-          let sessionToLoad = response.data[0] as {
-            session_id: string;
-            session_name?: string;
-            started_at?: string;
-          };
-          console.log(
-            "Default session to load (first in list):",
-            sessionToLoad.session_id
-          );
-
-          // try to find saved session id in available sessions
-          if (savedSessionId) {
-            const foundSession = response.data.find(
-              (s: { [key: string]: unknown }) =>
-                (s as { session_id: string }).session_id === savedSessionId
-            );
-            console.log("Found saved session in list:", foundSession);
-            if (foundSession) {
-              sessionToLoad = foundSession as {
-                session_id: string;
-                session_name?: string;
-                started_at?: string;
-              };
-              console.log(
-                "✅ Restored previously selected session:",
-                savedSessionId
-              );
-            } else {
-              console.log(
-                "❌ Previously selected session not found, using latest session"
-              );
-            }
-          } else {
-            console.log("❌ No saved session ID found, using latest session");
-          }
-
-          const messages = await loadSessionMessages(
-            agentId,
-            sessionToLoad.session_id
-          );
-
-          const session: ChatSession = {
-            id: sessionToLoad.session_id,
-            name: sessionToLoad.session_name || "Session",
-            messages,
-            selectedModel: selectedModel || "",
-            systemMessage: "You are a helpful assistant.",
-            agentId,
-            createdAt: sessionToLoad.started_at
-              ? new Date(sessionToLoad.started_at).getTime()
-              : Date.now(),
-            updatedAt: Date.now(),
-          };
-
-          setCurrentSession(session);
-          console.log(`💾 Saving session ID for agent ${agentId}:`, session.id);
-          SessionUtils.saveCurrentSessionId(session.id, agentId);
-          // cache session data
-          SessionUtils.saveSessionData(agentId, session);
-        } else {
-          // no sessions, create a new one
-          await createDefaultSession(agentId);
         }
+
+        // No cached session, create a new conversation
+        await createDefaultSession(templateId);
       } catch (error) {
-        console.error("Error loading agent sessions:", error);
-        // fallback to creating a new session
-        await createDefaultSession(agentId);
+        console.error("Error loading template conversations:", error);
+        // Fallback to creating a new conversation
+        await createDefaultSession(templateId);
       }
     },
-    [client, loadSessionMessages, createDefaultSession, selectedModel]
+    [createDefaultSession]
   );
 
+  // Backward compatibility alias
+  const loadAgentSessions = loadTemplateConversations;
+
   useEffect(() => {
-    const fetchAgents = async () => {
+    // Load templates from localStorage (no longer from backend)
+    const loadTemplates = () => {
       try {
-        setAgentsLoading(true);
-        const agentList = await client.agents.list();
-        setAgents(
-          (agentList.data as Array<{
-            agent_id: string;
-            agent_config?: {
-              agent_name?: string;
-              name?: string;
-              instructions?: string;
-            };
-            [key: string]: unknown;
-          }>) || []
-        );
+        setTemplatesLoading(true);
+        const templateList = PromptTemplateStore.list();
+        setTemplates(templateList);
 
-        if (agentList.data && agentList.data.length > 0) {
-          // check if there's a previously selected agent
-          const savedAgentId = SessionUtils.loadCurrentAgentId();
+        if (templateList.length > 0) {
+          // Check if there's a previously selected template
+          const savedTemplateId = PromptTemplateStore.getCurrentTemplateId() ||
+            SessionUtils.loadCurrentAgentId(); // Backward compat
 
-          let agentToSelect = agentList.data[0] as {
-            agent_id: string;
-            agent_config?: {
-              agent_name?: string;
-              name?: string;
-              instructions?: string;
-            };
-            [key: string]: unknown;
-          };
+          let templateToSelect = templateList[0];
 
-          // if we have a saved agent ID, find it in the available agents
-          if (savedAgentId) {
-            const foundAgent = agentList.data.find(
-              (a: { [key: string]: unknown }) =>
-                (a as { agent_id: string }).agent_id === savedAgentId
-            );
-            if (foundAgent) {
-              agentToSelect = foundAgent as typeof agentToSelect;
+          // If we have a saved template ID, find it
+          if (savedTemplateId) {
+            const foundTemplate = templateList.find(t => t.id === savedTemplateId);
+            if (foundTemplate) {
+              templateToSelect = foundTemplate;
             } else {
-              console.log("Previously slelected agent not found:");
+              console.log("Previously selected template not found");
             }
           }
-          setSelectedAgentId(agentToSelect.agent_id);
-          SessionUtils.saveCurrentAgentId(agentToSelect.agent_id);
-          // load agent config immediately
-          await loadAgentConfig(agentToSelect.agent_id);
-          // Note: loadAgentSessions will be called after models are loaded
+
+          setSelectedTemplateId(templateToSelect.id);
+          PromptTemplateStore.setCurrentTemplateId(templateToSelect.id);
+          SessionUtils.saveCurrentAgentId(templateToSelect.id); // Backward compat
+          // Load template config immediately
+          loadTemplateConfig(templateToSelect.id);
+          // Note: loadTemplateConversations will be called after models are loaded
         }
       } catch (error) {
-        console.error("Error fetching agents:", error);
+        console.error("Error loading templates:", error);
       } finally {
-        setAgentsLoading(false);
+        setTemplatesLoading(false);
       }
     };
 
-    fetchAgents();
+    loadTemplates();
 
     const fetchToolgroups = async () => {
       try {
@@ -401,7 +334,24 @@ export default function ChatPlaygroundPage() {
             : [];
 
         if (toolGroupsArray && Array.isArray(toolGroupsArray)) {
-          setAvailableToolgroups(toolGroupsArray);
+          // Cast to the expected type, including MCP endpoint URI
+          const mappedToolgroups = toolGroupsArray.map((tg: unknown) => {
+            const item = tg as {
+              identifier?: string;
+              provider_id?: string;
+              type?: string;
+              provider_resource_id?: string;
+              mcp_endpoint?: { uri: string };
+            };
+            return {
+              identifier: item.identifier || "",
+              provider_id: item.provider_id || "",
+              type: item.type || "",
+              provider_resource_id: item.provider_resource_id,
+              mcp_endpoint: item.mcp_endpoint,
+            };
+          });
+          setAvailableToolgroups(mappedToolgroups);
         } else {
           console.error("Invalid toolgroups data format:", toolgroups);
         }
@@ -419,26 +369,31 @@ export default function ChatPlaygroundPage() {
 
     fetchToolgroups();
 
-    const fetchVectorDBs = async () => {
+    const fetchVectorStores = async () => {
       try {
-        const vectorDBs = await client.vectorDBs.list();
+        const vectorStores = await client.vectorStores.list();
+        const vectorStoresData = Array.isArray(vectorStores)
+          ? vectorStores
+          : (vectorStores as { data?: unknown[] })?.data || [];
 
-        const vectorDBsArray = Array.isArray(vectorDBs) ? vectorDBs : [];
-
-        if (vectorDBsArray && Array.isArray(vectorDBsArray)) {
-          setAvailableVectorDBs(vectorDBsArray);
-        } else {
-          console.error("Invalid vector DBs data format:", vectorDBs);
-        }
+        setAvailableVectorDBs(vectorStoresData.map((vs: unknown) => {
+          const store = vs as { id?: string; identifier?: string; name?: string; embedding_model?: string };
+          return {
+            identifier: store.id || store.identifier || "",
+            vector_db_name: store.name,
+            embedding_model: store.embedding_model || "",
+          };
+        }));
       } catch (error) {
-        console.error("Error fetching vector DBs:", error);
+        console.error("Error fetching vector stores:", error);
       }
     };
 
-    fetchVectorDBs();
+    fetchVectorStores();
   }, [client, loadAgentSessions, loadAgentConfig]);
 
-  const createNewAgent = useCallback(
+  // Create a new prompt template (stored in localStorage)
+  const createNewTemplate = useCallback(
     async (
       name: string,
       instructions: string,
@@ -447,211 +402,151 @@ export default function ChatPlaygroundPage() {
       vectorDBs: string[] = []
     ) => {
       try {
-        const processedToolgroups = toolgroups.map(toolgroup => {
+        // Convert toolgroups to ToolConfig format for the Responses API
+        const tools = toolgroups.map(toolgroup => {
           if (toolgroup === "builtin::rag" && vectorDBs.length > 0) {
+            // RAG tools use file_search with vector store IDs
             return {
-              name: "builtin::rag/knowledge_search",
-              args: {
-                vector_db_ids: vectorDBs,
-              },
+              type: "file_search" as const,
+              vector_store_ids: vectorDBs,
             };
           }
-          return toolgroup;
+          // MCP tools require both server_label and server_url
+          if (toolgroup.startsWith("mcp::")) {
+            const serverLabel = toolgroup.replace("mcp::", "");
+            // Look up the server_url from availableToolgroups
+            const toolgroupInfo = availableToolgroups.find(
+              tg => tg.identifier === toolgroup
+            );
+            const serverUrl = toolgroupInfo?.mcp_endpoint?.uri || "";
+            return {
+              type: "mcp" as const,
+              server_label: serverLabel,
+              server_url: serverUrl,
+            };
+          }
+          // Default to MCP tool format - try to find endpoint info
+          const toolgroupInfo = availableToolgroups.find(
+            tg => tg.identifier === toolgroup
+          );
+          return {
+            type: "mcp" as const,
+            server_label: toolgroup,
+            server_url: toolgroupInfo?.mcp_endpoint?.uri || "",
+          };
         });
 
-        const agentConfig = {
+        // Create template in localStorage
+        const template = PromptTemplateStore.create({
+          name: name || "New Template",
           model,
           instructions,
-          name: name || undefined,
-          enable_session_persistence: true,
-          toolgroups:
-            processedToolgroups.length > 0 ? processedToolgroups : undefined,
-        };
-
-        const response = await client.agents.create({
-          agent_config: agentConfig,
+          tools,
         });
 
-        const agentList = await client.agents.list();
-        setAgents(
-          (agentList.data as Array<{
-            agent_id: string;
-            agent_config?: {
-              agent_name?: string;
-              name?: string;
-              instructions?: string;
-            };
-            [key: string]: unknown;
-          }>) || []
-        );
+        // Refresh template list
+        const templateList = PromptTemplateStore.list();
+        setTemplates(templateList);
 
-        setSelectedAgentId(response.agent_id);
-        await loadAgentConfig(response.agent_id);
-        await loadAgentSessions(response.agent_id);
+        // Select the new template
+        setSelectedTemplateId(template.id);
+        PromptTemplateStore.setCurrentTemplateId(template.id);
+        loadTemplateConfig(template.id);
 
-        return response.agent_id;
+        // Create a new conversation for this template
+        await createDefaultSession(template.id);
+
+        return template.id;
       } catch (error) {
-        console.error("Error creating agent:", error);
+        console.error("Error creating template:", error);
         throw error;
       }
     },
-    [client, loadAgentSessions, loadAgentConfig]
+    [loadTemplateConfig, createDefaultSession, availableToolgroups]
   );
+
+  // Backward compatibility alias
+  const createNewAgent = createNewTemplate;
 
   const handleVectorDBCreated = useCallback(
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    async (_vectorDbId: string) => {
+    async (_vectorStoreId: string) => {
       setShowCreateVectorDB(false);
 
       try {
-        const vectorDBs = await client.vectorDBs.list();
-        const vectorDBsArray = Array.isArray(vectorDBs) ? vectorDBs : [];
+        const vectorStores = await client.vectorStores.list();
+        const vectorStoresData = Array.isArray(vectorStores)
+          ? vectorStores
+          : (vectorStores as { data?: unknown[] })?.data || [];
 
-        if (vectorDBsArray && Array.isArray(vectorDBsArray)) {
-          setAvailableVectorDBs(vectorDBsArray);
-        }
+        setAvailableVectorDBs(vectorStoresData.map((vs: unknown) => {
+          const store = vs as { id?: string; identifier?: string; name?: string; embedding_model?: string };
+          return {
+            identifier: store.id || store.identifier || "",
+            vector_db_name: store.name,
+            embedding_model: store.embedding_model || "",
+          };
+        }));
       } catch (error) {
-        console.error("Error refreshing vector DBs:", error);
+        console.error("Error refreshing vector stores:", error);
       }
     },
     [client]
   );
 
-  const deleteAgent = useCallback(
-    async (agentId: string) => {
+  // Delete a prompt template (from localStorage)
+  const deleteTemplate = useCallback(
+    async (templateId: string) => {
       if (
         confirm(
-          "Are you sure you want to delete this agent? This action cannot be undone and will delete the agent and all its sessions."
+          "Are you sure you want to delete this template? This action cannot be undone."
         )
       ) {
         try {
-          // there's a known error where the delete API returns 500 even on success
-          try {
-            await client.agents.delete(agentId);
-            console.log("Agent deleted successfully");
-          } catch (deleteError) {
-            // log the error but don't re-throw - we know deletion succeeded
-            console.log(
-              "Agent delete API returned error (but deletion likely succeeded):",
-              deleteError
-            );
+          // Delete from localStorage
+          const deleted = PromptTemplateStore.delete(templateId);
+          if (!deleted) {
+            console.error("Template not found:", templateId);
+            return;
           }
 
-          SessionUtils.clearAgentCache(agentId);
+          // Clear cached session data
+          SessionUtils.clearAgentCache(templateId);
 
-          const agentList = await client.agents.list();
-          setAgents(
-            (agentList.data as Array<{
-              agent_id: string;
-              agent_config?: {
-                agent_name?: string;
-                name?: string;
-                instructions?: string;
-              };
-              [key: string]: unknown;
-            }>) || []
-          );
+          // Refresh template list
+          const templateList = PromptTemplateStore.list();
+          setTemplates(templateList);
 
-          // if we delete current agent, switch to another
-          if (selectedAgentId === agentId) {
-            const remainingAgents = agentList.data?.filter(
-              (a: { [key: string]: unknown }) =>
-                (a as { agent_id: string }).agent_id !== agentId
-            );
-            if (remainingAgents && remainingAgents.length > 0) {
-              const newAgent = remainingAgents[0] as {
-                agent_id: string;
-                agent_config?: {
-                  agent_name?: string;
-                  name?: string;
-                  instructions?: string;
-                };
-                [key: string]: unknown;
-              };
-              setSelectedAgentId(newAgent.agent_id);
-              SessionUtils.saveCurrentAgentId(newAgent.agent_id);
-              await loadAgentConfig(newAgent.agent_id);
-              await loadAgentSessions(newAgent.agent_id);
+          // If we deleted the current template, switch to another
+          if (selectedTemplateId === templateId) {
+            if (templateList.length > 0) {
+              const newTemplate = templateList[0];
+              setSelectedTemplateId(newTemplate.id);
+              PromptTemplateStore.setCurrentTemplateId(newTemplate.id);
+              loadTemplateConfig(newTemplate.id);
+              await loadTemplateConversations(newTemplate.id);
             } else {
-              // no agents left
-              setSelectedAgentId("");
+              // No templates left
+              setSelectedTemplateId("");
               setCurrentSession(null);
-              setSelectedAgentConfig(null);
+              setSelectedTemplate(null);
             }
           }
+
+          console.log("Template deleted successfully:", templateId);
         } catch (error) {
-          console.error("Error deleting agent:", error);
-
-          // check if this is known server bug where deletion succeeds but returns 500
-          // The error message will typically contain status codes or "Could not find agent"
-          const errorMessage =
-            error instanceof Error ? error.message : String(error);
-          const isKnownServerBug =
-            errorMessage.includes("500") ||
-            errorMessage.includes("Internal Server Error") ||
-            errorMessage.includes("Could not find agent") ||
-            errorMessage.includes("400");
-
-          if (isKnownServerBug) {
-            console.log(
-              "Agent deletion succeeded despite error, cleaning up UI"
-            );
-            SessionUtils.clearAgentCache(agentId);
-            try {
-              const agentList = await client.agents.list();
-              setAgents(
-                (agentList.data as Array<{
-                  agent_id: string;
-                  agent_config?: {
-                    agent_name?: string;
-                    name?: string;
-                    instructions?: string;
-                  };
-                  [key: string]: unknown;
-                }>) || []
-              );
-
-              if (selectedAgentId === agentId) {
-                const remainingAgents = agentList.data?.filter(
-                  (a: { [key: string]: unknown }) =>
-                    (a as { agent_id: string }).agent_id !== agentId
-                );
-                if (remainingAgents && remainingAgents.length > 0) {
-                  const newAgent = remainingAgents[0] as {
-                    agent_id: string;
-                    agent_config?: {
-                      agent_name?: string;
-                      name?: string;
-                      instructions?: string;
-                    };
-                    [key: string]: unknown;
-                  };
-                  setSelectedAgentId(newAgent.agent_id);
-                  SessionUtils.saveCurrentAgentId(newAgent.agent_id);
-                  await loadAgentConfig(newAgent.agent_id);
-                  await loadAgentSessions(newAgent.agent_id);
-                } else {
-                  // no agents left
-                  setSelectedAgentId("");
-                  setCurrentSession(null);
-                  setSelectedAgentConfig(null);
-                }
-              }
-            } catch (refreshError) {
-              console.error("Error refreshing agents list:", refreshError);
-            }
-          } else {
-            // show error that we don't know about to user
-            console.error("Unexpected error during agent deletion:", error);
-            if (error instanceof Error) {
-              alert(`Failed to delete agent: ${error.message}`);
-            }
+          console.error("Error deleting template:", error);
+          if (error instanceof Error) {
+            alert(`Failed to delete template: ${error.message}`);
           }
         }
       }
     },
-    [client, selectedAgentId, loadAgentConfig, loadAgentSessions]
+    [selectedTemplateId, loadTemplateConfig, loadTemplateConversations]
   );
+
+  // Backward compatibility alias
+  const deleteAgent = deleteTemplate;
 
   const handleModelChange = useCallback((newModel: string) => {
     setSelectedModel(newModel);
@@ -668,13 +563,14 @@ export default function ChatPlaygroundPage() {
 
   useEffect(() => {
     if (currentSession) {
-      SessionUtils.saveCurrentSessionId(
-        currentSession.id,
-        currentSession.agentId
-      );
-      // cache session data
-      SessionUtils.saveSessionData(currentSession.agentId, currentSession);
-      // only update selectedModel if the session has a valid model and it's different from current
+      // Use templateId (new) or agentId (backward compat) for session storage
+      const storageId = currentSession.templateId || currentSession.agentId;
+      if (storageId) {
+        SessionUtils.saveCurrentSessionId(currentSession.id, storageId);
+        // Cache session data
+        SessionUtils.saveSessionData(storageId, currentSession);
+      }
+      // Only update selectedModel if the session has a valid model and it's different from current
       if (
         currentSession.selectedModel &&
         currentSession.selectedModel !== selectedModel
@@ -755,8 +651,11 @@ export default function ChatPlaygroundPage() {
         messages: [...prev.messages, userMessage],
         updatedAt: Date.now(),
       };
-      // update cache with new message
-      SessionUtils.saveSessionData(prev.agentId, updatedSession);
+      // Update cache with new message
+      const storageId = prev.templateId || prev.agentId;
+      if (storageId) {
+        SessionUtils.saveSessionData(storageId, updatedSession);
+      }
       return updatedSession;
     });
     setInput("");
@@ -765,7 +664,7 @@ export default function ChatPlaygroundPage() {
   };
 
   const handleSubmitWithContent = async (content: string) => {
-    if (!currentSession || !selectedAgentId) return;
+    if (!currentSession || !selectedTemplateId) return;
 
     setIsGenerating(true);
     setError(null);
@@ -778,25 +677,41 @@ export default function ChatPlaygroundPage() {
     abortControllerRef.current = abortController;
 
     try {
-      const userMessage = {
-        role: "user" as const,
-        content,
-      };
+      // Get the current template for model, instructions, and tools
+      const template = selectedTemplate || PromptTemplateStore.get(selectedTemplateId);
+      if (!template) {
+        throw new Error("No template selected");
+      }
 
-      const turnParams: TurnCreateParams = {
-        messages: [userMessage],
+      // Build the response request params using the Responses API
+      const responseParams: ResponseCreateParams = {
+        model: template.model || selectedModel,
+        input: content,
         stream: true,
       };
 
-      const response = await client.agents.turn.create(
-        selectedAgentId,
-        currentSession.id,
-        turnParams,
-        {
-          signal: abortController.signal,
-          timeout: 300000, // 5 minutes timeout for RAG queries
-        } as { signal: AbortSignal; timeout: number }
-      );
+      // Add instructions if available
+      if (template.instructions) {
+        responseParams.instructions = template.instructions;
+      }
+
+      // Add conversation ID to maintain context
+      // Note: 'conversation' is for the conversation ID, 'previous_response_id' is for chaining responses
+      if (currentSession.id) {
+        responseParams.conversation = currentSession.id;
+      }
+
+      // Add tools from template (MCP tools, etc.)
+      if (template.tools && template.tools.length > 0) {
+        // Cast to the expected type - our ToolConfig is compatible
+        responseParams.tools = template.tools as ResponseCreateParams["tools"];
+      }
+
+      // Create response using the Responses API
+      const response = await client.responses.create(responseParams, {
+        signal: abortController.signal,
+        timeout: 300000, // 5 minutes timeout for RAG queries
+      } as { signal: AbortSignal; timeout: number });
 
       const assistantMessage: Message = {
         id: (Date.now() + 1).toString(),
@@ -805,247 +720,57 @@ export default function ChatPlaygroundPage() {
         createdAt: new Date(),
       };
 
-      const processChunk = (
-        chunk: unknown
+      // Process streaming events from the Responses API
+      const processStreamEvent = (
+        event: unknown
       ): { text: string | null; isToolCall: boolean } => {
-        const chunkObj = chunk as Record<string, unknown>;
+        const eventObj = event as Record<string, unknown>;
 
-        // Skip turn_complete events to avoid duplicate content
-        // These events contain the full accumulated content which we already have from streaming deltas
-        if (
-          chunkObj?.event &&
-          typeof chunkObj.event === "object" &&
-          chunkObj.event !== null
-        ) {
-          const event = chunkObj.event as Record<string, unknown>;
-          if (
-            event?.payload &&
-            typeof event.payload === "object" &&
-            event.payload !== null
-          ) {
-            const payload = event.payload as Record<string, unknown>;
-            if (payload.event_type === "turn_complete") {
-              return { text: null, isToolCall: false };
-            }
-          }
+        // Skip completed events to avoid duplicate content
+        if (isCompletedEvent(eventObj)) {
+          return { text: null, isToolCall: false };
         }
 
-        // helper to check if content contains function call JSON
-        const containsToolCall = (content: string): boolean => {
-          return (
-            content.includes('"type": "function"') ||
-            content.includes('"name": "knowledge_search"') ||
-            content.includes('"parameters":') ||
-            !!content.match(/\{"type":\s*"function".*?\}/)
-          );
-        };
-
-        let isToolCall = false;
-        let potentialContent = "";
-
-        if (typeof chunk === "string") {
-          potentialContent = chunk;
-          isToolCall = containsToolCall(chunk);
-        }
-
-        if (
-          chunkObj?.delta &&
-          typeof chunkObj.delta === "object" &&
-          chunkObj.delta !== null
-        ) {
-          const delta = chunkObj.delta as Record<string, unknown>;
-          if ("tool_calls" in delta) {
-            isToolCall = true;
-          }
-          if (typeof delta.text === "string") {
-            potentialContent = delta.text;
-            if (containsToolCall(delta.text)) {
-              isToolCall = true;
-            }
-          }
-        }
-
-        if (
-          chunkObj?.event &&
-          typeof chunkObj.event === "object" &&
-          chunkObj.event !== null
-        ) {
-          const event = chunkObj.event as Record<string, unknown>;
-
-          if (
-            event?.payload &&
-            typeof event.payload === "object" &&
-            event.payload !== null
-          ) {
-            const payload = event.payload as Record<string, unknown>;
-            if (typeof payload.content === "string") {
-              potentialContent = payload.content;
-              if (containsToolCall(payload.content)) {
-                isToolCall = true;
-              }
-            }
-
-            if (
-              payload?.delta &&
-              typeof payload.delta === "object" &&
-              payload.delta !== null
-            ) {
-              const delta = payload.delta as Record<string, unknown>;
-              if (typeof delta.text === "string") {
-                potentialContent = delta.text;
-                if (containsToolCall(delta.text)) {
-                  isToolCall = true;
-                }
-              }
-            }
-          }
-
-          if (
-            event?.delta &&
-            typeof event.delta === "object" &&
-            event.delta !== null
-          ) {
-            const delta = event.delta as Record<string, unknown>;
-            if (typeof delta.text === "string") {
-              potentialContent = delta.text;
-              if (containsToolCall(delta.text)) {
-                isToolCall = true;
-              }
-            }
-            if (typeof delta.content === "string") {
-              // eslint-disable-next-line @typescript-eslint/no-unused-vars
-              potentialContent = delta.content;
-              if (containsToolCall(delta.content)) {
-                isToolCall = true;
-              }
-            }
-          }
-        }
-
-        // if it's a tool call, skip it (don't display in chat)
-        if (isToolCall) {
+        // Handle MCP tool calls - skip them from text display
+        if (isMCPCallInProgressEvent(eventObj) || isMCPCallCompletedEvent(eventObj)) {
           return { text: null, isToolCall: true };
         }
 
+        // Handle text delta events - this is the main streaming content
+        if (isTextDeltaEvent(eventObj)) {
+          const delta = (eventObj as { delta?: unknown }).delta;
+          if (typeof delta === "string") {
+            return { text: extractCleanText(delta), isToolCall: false };
+          }
+        }
+
+        // Fallback: try to extract text from various event structures
         let text: string | null = null;
 
-        if (
-          chunkObj?.delta &&
-          typeof chunkObj.delta === "object" &&
-          chunkObj.delta !== null
-        ) {
-          const delta = chunkObj.delta as Record<string, unknown>;
-          if (typeof delta.text === "string") {
-            text = extractCleanText(delta.text);
+        // Check for delta property (common in streaming)
+        if (eventObj.delta && typeof eventObj.delta === "string") {
+          text = extractCleanText(eventObj.delta);
+        }
+
+        // Check for type-specific handling
+        if (!text && eventObj.type === "response.output_text.delta") {
+          if (typeof eventObj.delta === "string") {
+            text = extractCleanText(eventObj.delta);
           }
         }
 
+        // Handle OpenAI-compatible format (choices array)
+        const rawEvent = event as Record<string, unknown>;
+        const choices = rawEvent.choices;
         if (
           !text &&
-          chunkObj?.event &&
-          typeof chunkObj.event === "object" &&
-          chunkObj.event !== null
+          choices &&
+          Array.isArray(choices) &&
+          choices.length > 0
         ) {
-          const event = chunkObj.event as Record<string, unknown>;
-
+          const choice = choices[0] as Record<string, unknown>;
           if (
-            event?.payload &&
-            typeof event.payload === "object" &&
-            event.payload !== null
-          ) {
-            const payload = event.payload as Record<string, unknown>;
-
-            if (typeof payload.content === "string") {
-              text = extractCleanText(payload.content);
-            }
-
-            if (
-              !text &&
-              payload?.turn &&
-              typeof payload.turn === "object" &&
-              payload.turn !== null
-            ) {
-              const turn = payload.turn as Record<string, unknown>;
-              if (
-                turn?.output_message &&
-                typeof turn.output_message === "object" &&
-                turn.output_message !== null
-              ) {
-                const outputMessage = turn.output_message as Record<
-                  string,
-                  unknown
-                >;
-                if (typeof outputMessage.content === "string") {
-                  text = extractCleanText(outputMessage.content);
-                }
-              }
-
-              if (
-                !text &&
-                turn?.steps &&
-                Array.isArray(turn.steps) &&
-                turn.steps.length > 0
-              ) {
-                for (const step of turn.steps) {
-                  if (step && typeof step === "object" && step !== null) {
-                    const stepObj = step as Record<string, unknown>;
-                    if (
-                      stepObj?.model_response &&
-                      typeof stepObj.model_response === "object" &&
-                      stepObj.model_response !== null
-                    ) {
-                      const modelResponse = stepObj.model_response as Record<
-                        string,
-                        unknown
-                      >;
-                      if (typeof modelResponse.content === "string") {
-                        text = extractCleanText(modelResponse.content);
-                        break;
-                      }
-                    }
-                  }
-                }
-              }
-            }
-
-            if (
-              !text &&
-              payload?.delta &&
-              typeof payload.delta === "object" &&
-              payload.delta !== null
-            ) {
-              const delta = payload.delta as Record<string, unknown>;
-              if (typeof delta.text === "string") {
-                text = extractCleanText(delta.text);
-              }
-            }
-          }
-
-          if (
-            !text &&
-            event?.delta &&
-            typeof event.delta === "object" &&
-            event.delta !== null
-          ) {
-            const delta = event.delta as Record<string, unknown>;
-            if (typeof delta.text === "string") {
-              text = extractCleanText(delta.text);
-            }
-            if (!text && typeof delta.content === "string") {
-              text = extractCleanText(delta.content);
-            }
-          }
-        }
-
-        if (
-          !text &&
-          chunkObj?.choices &&
-          Array.isArray(chunkObj.choices) &&
-          chunkObj.choices.length > 0
-        ) {
-          const choice = chunkObj.choices[0] as Record<string, unknown>;
-          if (
-            choice?.delta &&
+            choice.delta &&
             typeof choice.delta === "object" &&
             choice.delta !== null
           ) {
@@ -1056,12 +781,11 @@ export default function ChatPlaygroundPage() {
           }
         }
 
-        if (!text && typeof chunk === "string") {
-          text = extractCleanText(chunk);
-        }
-
         return { text, isToolCall: false };
       };
+
+      // Add assistant message placeholder
+      const storageId = currentSession.templateId || currentSession.agentId;
       setCurrentSession(prev => {
         if (!prev) return null;
         const updatedSession = {
@@ -1069,8 +793,10 @@ export default function ChatPlaygroundPage() {
           messages: [...prev.messages, assistantMessage],
           updatedAt: Date.now(),
         };
-        // update cache with assistant message
-        SessionUtils.saveSessionData(prev.agentId, updatedSession);
+        // Update cache with assistant message
+        if (storageId) {
+          SessionUtils.saveSessionData(storageId, updatedSession);
+        }
         return updatedSession;
       });
 
@@ -1079,33 +805,8 @@ export default function ChatPlaygroundPage() {
       const thinkingParts: ThinkingPart[] = [];
       let currentThinkingStartTime: number | null = null;
 
-      for await (const chunk of response) {
-        const { text: deltaText } = processChunk(chunk);
-
-        // logging for debugging function calls
-        // if (deltaText && deltaText.includes("knowledge_search")) {
-        //   console.log("🔍 Function call detected in text output:", deltaText);
-        //   console.log("🔍 Original chunk:", JSON.stringify(chunk, null, 2));
-        // }
-
-        if (chunk && typeof chunk === "object" && "event" in chunk) {
-          const event = (
-            chunk as {
-              event: {
-                payload?: {
-                  event_type?: string;
-                  turn?: { output_message?: { content?: string } };
-                };
-              };
-            }
-          ).event;
-          if (event?.payload?.event_type === "turn_complete") {
-            const content = event?.payload?.turn?.output_message?.content;
-            if (content && content.includes("knowledge_search")) {
-              console.log("🔍 Function call found in turn_complete:", content);
-            }
-          }
-        }
+      for await (const event of response) {
+        const { text: deltaText } = processStreamEvent(event);
 
         if (deltaText) {
           // Add to buffer for thinking extraction
@@ -1172,10 +873,11 @@ export default function ChatPlaygroundPage() {
                 messages: newMessages,
                 updatedAt: Date.now(),
               };
-              // update cache with streaming content
-              if (fullContent.length % 100 === 0) {
+              // Update cache with streaming content
+              const sid = prev.templateId || prev.agentId;
+              if (fullContent.length % 100 === 0 && sid) {
                 // Only cache every 100 characters
-                SessionUtils.saveSessionData(prev.agentId, updatedSession);
+                SessionUtils.saveSessionData(sid, updatedSession);
               }
               return updatedSession;
             });
@@ -1202,10 +904,13 @@ export default function ChatPlaygroundPage() {
     } finally {
       setIsGenerating(false);
       abortControllerRef.current = null;
-      // cache final session state after streaming completes
+      // Cache final session state after streaming completes
       setCurrentSession(prev => {
         if (prev) {
-          SessionUtils.saveSessionData(prev.agentId, prev);
+          const storageId = prev.templateId || prev.agentId;
+          if (storageId) {
+            SessionUtils.saveSessionData(storageId, prev);
+          }
         }
         return prev;
       });
@@ -1250,21 +955,29 @@ export default function ChatPlaygroundPage() {
   };
 
   const handleRAGFileUpload = async (file: File) => {
-    if (!selectedAgentConfig?.toolgroups || !selectedAgentId) {
-      setError("No agent selected or agent has no RAG tools configured");
+    if (!selectedTemplate?.tools || !selectedTemplateId) {
+      setError("No template selected or template has no RAG tools configured");
       return;
     }
 
-    // find RAG toolgroups that have vector_db_ids configured
-    const ragToolgroups = selectedAgentConfig.toolgroups.filter(toolgroup => {
-      if (typeof toolgroup === "object" && toolgroup.name?.includes("rag")) {
-        return toolgroup.args && "vector_db_ids" in toolgroup.args;
-      }
-      return false;
-    });
+    // Find file_search tools that have vector_store_ids configured (new format)
+    // Also support legacy toolgroups format for backward compatibility
+    const vectorStoreIds: string[] = [];
 
-    if (ragToolgroups.length === 0) {
-      setError("Current agent has no vector databases configured for RAG");
+    for (const tool of selectedTemplate.tools) {
+      if (tool.type === "file_search" && "vector_store_ids" in tool) {
+        const ids = (tool as { vector_store_ids?: string[] }).vector_store_ids;
+        if (ids) {
+          vectorStoreIds.push(...ids);
+        }
+      }
+    }
+
+    // Note: Legacy toolgroups format is no longer supported
+    // All tools should be in the new ToolConfig format
+
+    if (vectorStoreIds.length === 0) {
+      setError("Current template has no vector databases configured for RAG");
       return;
     }
 
@@ -1278,18 +991,7 @@ export default function ChatPlaygroundPage() {
         type: "loading",
       });
 
-      const vectorDbIds = ragToolgroups.flatMap(toolgroup => {
-        if (
-          typeof toolgroup === "object" &&
-          toolgroup.args &&
-          "vector_db_ids" in toolgroup.args
-        ) {
-          return toolgroup.args.vector_db_ids as string[];
-        }
-        return [];
-      });
-
-      // determine mime type from file extension - this should be in the Llama Stack Client IMO
+      // Determine mime type from file extension
       const getContentType = (filename: string): string => {
         const ext = filename.toLowerCase().split(".").pop();
         switch (ext) {
@@ -1338,25 +1040,51 @@ export default function ChatPlaygroundPage() {
         });
       }
 
-      for (const vectorDbId of vectorDbIds) {
-        await client.toolRuntime.ragTool.insert({
-          documents: [
-            {
-              content: fileContent,
-              document_id: `${file.name}-${Date.now()}`,
-              metadata: {
-                filename: file.name,
-                file_size: file.size,
-                uploaded_at: new Date().toISOString(),
-                agent_id: selectedAgentId,
-              },
-              mime_type: mimeType,
+      for (const vectorStoreId of vectorStoreIds) {
+        // Try the new VectorStores file API first, fallback to legacy ragTool
+        try {
+          // New API: vectorStores.files.create
+          await client.vectorStores.files.create(vectorStoreId, {
+            file_id: `${file.name}-${Date.now()}`,
+            attributes: {
+              filename: file.name,
+              file_size: file.size,
+              uploaded_at: new Date().toISOString(),
+              template_id: selectedTemplateId,
             },
-          ],
-          vector_db_id: vectorDbId,
-          // TODO: parameterize this somewhere, probably in settings
-          chunk_size_in_tokens: 512,
-        });
+            chunking_strategy: {
+              type: "auto",
+            },
+          });
+        } catch {
+          // Fallback to legacy ragTool API if available
+          const toolRuntime = client.toolRuntime as {
+            ragTool?: {
+              insert: (params: unknown) => Promise<unknown>;
+            };
+          };
+          if (toolRuntime.ragTool) {
+            await toolRuntime.ragTool.insert({
+              documents: [
+                {
+                  content: fileContent,
+                  document_id: `${file.name}-${Date.now()}`,
+                  metadata: {
+                    filename: file.name,
+                    file_size: file.size,
+                    uploaded_at: new Date().toISOString(),
+                    template_id: selectedTemplateId,
+                  },
+                  mime_type: mimeType,
+                },
+              ],
+              vector_db_id: vectorStoreId,
+              chunk_size_in_tokens: 512,
+            });
+          } else {
+            throw new Error("RAG file upload API not available");
+          }
+        }
       }
 
       console.log("✅ File successfully uploaded using RAG tool");
@@ -1580,83 +1308,70 @@ export default function ChatPlaygroundPage() {
                   Configured Tools (Coming Soon)
                 </label>
                 <div className="space-y-2">
-                  {selectedAgentConfig?.toolgroups &&
-                  selectedAgentConfig.toolgroups.length > 0 ? (
-                    selectedAgentConfig.toolgroups.map(
-                      (
-                        toolgroup:
-                          | string
-                          | { name: string; args: Record<string, unknown> },
-                        index: number
-                      ) => {
-                        const toolName =
-                          typeof toolgroup === "string"
-                            ? toolgroup
-                            : toolgroup.name;
-                        const toolArgs =
-                          typeof toolgroup === "object" ? toolgroup.args : null;
+                  {selectedTemplate?.tools && selectedTemplate.tools.length > 0 ? (
+                    selectedTemplate.tools.map((tool, index: number) => {
+                      // Determine tool display based on type
+                      let displayName: string;
+                      let displayIcon: string;
+                      let toolDetails: React.ReactNode = null;
 
-                        const isRAGTool = toolName.includes("rag");
-                        const displayName = isRAGTool ? "RAG Search" : toolName;
-                        const displayIcon = isRAGTool
-                          ? "🔍"
-                          : toolName.includes("search")
-                            ? "🌐"
-                            : "🔧";
-
-                        return (
-                          <div
-                            key={index}
-                            className="p-3 border border-input rounded-md bg-muted text-muted-foreground"
-                          >
-                            <div className="flex items-center justify-between">
-                              <div className="flex items-center gap-2">
-                                <span className="text-sm">{displayIcon}</span>
-                                <span className="text-sm font-medium text-primary">
-                                  {displayName}
-                                </span>
-                              </div>
-                            </div>
-                            {isRAGTool && toolArgs && toolArgs.vector_db_ids ? (
+                      switch (tool.type) {
+                        case "mcp":
+                          displayName = `MCP: ${(tool as { server_label?: string }).server_label || "Unknown"}`;
+                          displayIcon = "🔌";
+                          break;
+                        case "file_search":
+                          displayName = "RAG Search";
+                          displayIcon = "🔍";
+                          const vectorIds = (tool as { vector_store_ids?: string[] }).vector_store_ids;
+                          if (vectorIds && vectorIds.length > 0) {
+                            toolDetails = (
                               <div className="mt-2 text-xs text-muted-foreground">
-                                <span className="font-medium">
-                                  Vector Databases:
-                                </span>
+                                <span className="font-medium">Vector Stores:</span>
                                 <div className="mt-1 flex flex-wrap gap-1">
-                                  {Array.isArray(toolArgs.vector_db_ids) ? (
-                                    toolArgs.vector_db_ids.map(
-                                      (dbId: string, idx: number) => (
-                                        <code
-                                          key={idx}
-                                          className="px-1.5 py-0.5 bg-muted-foreground/10 rounded text-xs"
-                                        >
-                                          {dbId}
-                                        </code>
-                                      )
-                                    )
-                                  ) : (
-                                    <code className="px-1.5 py-0.5 bg-muted-foreground/10 rounded text-xs">
-                                      {String(toolArgs.vector_db_ids)}
+                                  {vectorIds.map((storeId: string, idx: number) => (
+                                    <code
+                                      key={idx}
+                                      className="px-1.5 py-0.5 bg-muted-foreground/10 rounded text-xs"
+                                    >
+                                      {storeId}
                                     </code>
-                                  )}
+                                  ))}
                                 </div>
                               </div>
-                            ) : null}
-                            {!isRAGTool &&
-                              toolArgs &&
-                              Object.keys(toolArgs).length > 0 && (
-                                <div className="mt-2 text-xs text-muted-foreground">
-                                  <span className="font-medium">
-                                    Configuration:
-                                  </span>{" "}
-                                  {Object.keys(toolArgs).length} parameter
-                                  {Object.keys(toolArgs).length > 1 ? "s" : ""}
-                                </div>
-                              )}
-                          </div>
-                        );
+                            );
+                          }
+                          break;
+                        case "web_search":
+                          displayName = "Web Search";
+                          displayIcon = "🌐";
+                          break;
+                        case "function":
+                          displayName = (tool as { name?: string }).name || "Function";
+                          displayIcon = "🔧";
+                          break;
+                        default:
+                          displayName = "Unknown Tool";
+                          displayIcon = "❓";
                       }
-                    )
+
+                      return (
+                        <div
+                          key={index}
+                          className="p-3 border border-input rounded-md bg-muted text-muted-foreground"
+                        >
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm">{displayIcon}</span>
+                              <span className="text-sm font-medium text-primary">
+                                {displayName}
+                              </span>
+                            </div>
+                          </div>
+                          {toolDetails}
+                        </div>
+                      );
+                    })
                   ) : (
                     <div className="p-3 border border-input rounded-md bg-muted text-center">
                       <p className="text-sm text-muted-foreground">
