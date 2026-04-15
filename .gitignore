@@ -41,3 +41,5 @@ tests/integration/client-typescript/node_modules/
 node_modules/
 package-lock.json
 package.json
+sql_store.db-shm
+sql_store.db-wal
